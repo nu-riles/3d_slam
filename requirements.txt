@@ -1,0 +1,11 @@
+# Core dataset access
+physical_ai_av           # pip install git+https://github.com/NVlabs/physical_ai_av
+huggingface_hub>=0.23
+
+# Vision & SLAM
+opencv-python-headless>=4.9
+open3d>=0.18
+numpy>=1.26
+
+# Utilities
+tqdm>=4.66
