@@ -80,7 +80,7 @@ FRAMES_PER_CLIP = 3
 
 base      = Path('/scratch/' + os.environ['USER'] + '/lidar_fusion')
 out_dir   = base / 'output'
-decoder   = Path(os.path.expanduser('~/repos/dl/3d_slam/3d_slam/.env/bin/draco_decoder'))
+decoder   = Path(os.path.expanduser('~/repos/dl/3d_slam/3d_slam/.envs/bin/draco_decoder'))
 os.makedirs(out_dir, exist_ok=True)
 
 cam_zip   = base / 'camera/camera_front_wide_120fov/camera_front_wide_120fov.chunk_0000.zip'
@@ -207,6 +207,9 @@ for clip_uuid in tqdm(clip_uuids, desc='Clips'):
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_indices = np.linspace(0, total-1, FRAMES_PER_CLIP, dtype=int)
 
+        clip_pts = []
+        clip_rgb = []
+
         for fi in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
             ret, frame = cap.read()
@@ -215,55 +218,28 @@ for clip_uuid in tqdm(clip_uuids, desc='Clips'):
 
             uvd, mask = project_ftheta(points, T_lidar_to_cam, cx, cy, a2p, max_a, W, H)
             colored_pts = points[mask]
-
-            # Sample RGB
             rgb = frame[uvd[:,1].astype(int), uvd[:,0].astype(int)][:,::-1] / 255.0
-
-            # Transform to world frame via egomotion
-            N = len(colored_pts)
-            pts_h = np.hstack([colored_pts, np.ones((N,1), dtype=np.float32)])
-            world_pts = (T_ego @ pts_h.T).T[:,:3]
-
-            all_world_pts.append(world_pts)
-            all_world_rgb.append(rgb)
+            clip_pts.append(colored_pts)
+            clip_rgb.append(rgb)
 
         cap.release()
-        print(f'  {clip_uuid}: {len(colored_pts):,} pts/frame')
+
+        # Merge 3 frames and save per-clip PLY
+        if clip_pts:
+            merged_pts = np.vstack(clip_pts).astype(np.float64)
+            merged_rgb = np.vstack(clip_rgb).astype(np.float64)
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(merged_pts)
+            pcd.colors = o3d.utility.Vector3dVector(merged_rgb)
+            pcd = pcd.voxel_down_sample(voxel_size=0.05)
+            ply_path = out_dir / f'{clip_uuid}.ply'
+            o3d.io.write_point_cloud(str(ply_path), pcd)
+            print(f'  {clip_uuid}: {len(pcd.points):,} pts saved to {ply_path.name}')
 
     except Exception as e:
         print(f'  Skipping {clip_uuid}: {e}')
         continue
 
-# --- Merge and save global point cloud ---
-print(f'\nMerging {sum(len(p) for p in all_world_pts):,} total points...')
-all_pts = np.vstack(all_world_pts).astype(np.float64)
-all_rgb = np.vstack(all_world_rgb).astype(np.float64)
-
-pcd = o3d.geometry.PointCloud()
-pcd.points = o3d.utility.Vector3dVector(all_pts)
-pcd.colors = o3d.utility.Vector3dVector(all_rgb)
-pcd = pcd.voxel_down_sample(voxel_size=0.1)
-o3d.io.write_point_cloud(str(out_dir/'reconstruction.ply'), pcd)
-print(f'Saved reconstruction.ply ({len(pcd.points):,} pts after voxel downsample)')
-
-# --- Global bird's-eye-view ---
-pts = np.asarray(pcd.points)
-rgb = np.asarray(pcd.colors)
-x, y = pts[:,0], pts[:,1]
-rm = max(np.abs(x).max(), np.abs(y).max()) + 5
-res = 0.2; sz = int(2*rm/res)
-bev = np.zeros((sz,sz,3), dtype=np.uint8)
-px = ((rm-y)/res).astype(int); py = ((rm-x)/res).astype(int)
-valid = (px>=0)&(px<sz)&(py>=0)&(py<sz)
-bev[py[valid],px[valid]] = (rgb[valid]*255).astype(np.uint8)[:,::-1]
-ci = sz//2
-cv2.rectangle(bev,(ci-4,ci-8),(ci+4,ci+8),(0,255,0),-1)
-for r_m in np.linspace(10, int(rm), 5):
-    cv2.circle(bev,(ci,ci),int(r_m/res),(80,80,80),1)
-    cv2.putText(bev,f'{int(r_m)}m',(ci+int(r_m/res)+2,ci),
-                cv2.FONT_HERSHEY_SIMPLEX,0.4,(120,120,120),1)
-cv2.imwrite(str(out_dir/'bev_global.png'), bev)
-print(f'Saved bev_global.png')
 print(f'\nAll outputs in {out_dir}')
 EOF
 
