@@ -51,14 +51,20 @@ EOF
 echo "Downloading egomotion data..."
 python3 - <<'EOF'
 from huggingface_hub import hf_hub_download, login
-import os
+import os, zipfile
+from pathlib import Path
 login(token=os.environ['HF_TOKEN'])
-base = '/scratch/' + os.environ['USER'] + '/lidar_fusion'
-hf_hub_download(repo_id='nvidia/PhysicalAI-Autonomous-Vehicles',
-                repo_type='dataset',
-                filename='labels/egomotion.offline/egomotion.offline.chunk_0000.parquet',
-                local_dir=base)
-print('Downloaded egomotion')
+base = Path('/scratch/' + os.environ['USER'] + '/lidar_fusion')
+zip_path = hf_hub_download(repo_id='nvidia/PhysicalAI-Autonomous-Vehicles',
+                           repo_type='dataset',
+                           filename='labels/egomotion.offline/egomotion.offline.chunk_0000.zip',
+                           local_dir=str(base))
+# Extract all parquets from the zip
+with zipfile.ZipFile(zip_path) as zf:
+    for name in zf.namelist():
+        if name.endswith('.parquet'):
+            zf.extract(name, base / 'labels/egomotion.offline/')
+print('Downloaded and extracted egomotion')
 EOF
 
 # ── Run the multi-clip fusion pipeline ──────────────────────────────
