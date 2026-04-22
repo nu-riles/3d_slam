@@ -89,7 +89,7 @@ lidar_zip = base / 'lidar/lidar_top_360fov/lidar_top_360fov.chunk_0000.zip'
 # --- Load calibration ---
 intr_df = pd.read_parquet(base/'calibration/camera_intrinsics.offline/camera_intrinsics.offline.chunk_0000.parquet').reset_index()
 ext_df  = pd.read_parquet(base/'calibration/sensor_extrinsics.offline/sensor_extrinsics.offline.chunk_0000.parquet').reset_index()
-ego_df  = pd.read_parquet(base/'labels/egomotion.offline/egomotion.offline.chunk_0000.parquet').reset_index()
+ego_zip = base/'labels/egomotion.offline/egomotion.offline.chunk_0000.zip'
 
 # --- Get all clip UUIDs from chunk 0 ---
 with zipfile.ZipFile(cam_zip) as zf:
@@ -111,15 +111,20 @@ def get_T(df, clip, sensor):
     return T
 
 def get_ego_T(clip):
-    # Use first egomotion entry for the clip as world-frame pose
-    rows = ego_df[ego_df.clip_id==clip].sort_values('timestamp_ns')
-    if rows.empty:
+    try:
+        with zipfile.ZipFile(ego_zip) as zf:
+            fname = f"{clip}.egomotion.offline.parquet"
+            with zf.open(fname) as f:
+                rows = pd.read_parquet(f).reset_index().sort_values("timestamp_ns")
+        if rows.empty:
+            return np.eye(4)
+        r = rows.iloc[0]
+        T = np.eye(4)
+        T[:3,:3] = quat_to_R(r.qx, r.qy, r.qz, r.qw)
+        T[:3,3]  = [r.x, r.y, r.z]
+        return T
+    except Exception:
         return np.eye(4)
-    r = rows.iloc[0]
-    T = np.eye(4)
-    T[:3,:3] = quat_to_R(r.qx, r.qy, r.qz, r.qw)
-    T[:3,3]  = [r.x, r.y, r.z]
-    return T
 
 def decode_draco(raw):
     with tempfile.TemporaryDirectory() as tmp:
