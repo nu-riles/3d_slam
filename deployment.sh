@@ -56,7 +56,7 @@ login(token=os.environ['HF_TOKEN'])
 base = '/scratch/' + os.environ['USER'] + '/lidar_fusion'
 hf_hub_download(repo_id='nvidia/PhysicalAI-Autonomous-Vehicles',
                 repo_type='dataset',
-                filename='labels/egomotion.offline/egomotion.offline.chunk_0000.parquet',
+                filename='egomotion.offline/egomotion.offline.chunk_0000.parquet',
                 local_dir=base)
 print('Downloaded egomotion')
 EOF
