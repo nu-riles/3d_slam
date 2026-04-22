@@ -2,10 +2,10 @@ python3 - <<'EOF'
 import pandas as pd, numpy as np, json, os, cv2, subprocess, tempfile
 from pathlib import Path
 
-base      = Path("/scratch/nu-riles/lidar_fusion")
+base      = Path("/scratch/$USER/lidar_fusion")
 out_dir   = base / "output"
 clip_uuid = "25cd4769-5dcf-4b53-a351-bf2c5deb6124"
-decoder   = Path(os.path.expanduser("~/repos/dl/3d_slam/3d_slam/.envs/bin/draco_decoder"))
+decoder   = Path(os.path.expanduser("~/repos/dl/3d_slam/3d_slam/.env/bin/draco_decoder"))
 
 # ── draco decoder ────────────────────────────────────────────────────
 def decode_draco(raw_bytes):
