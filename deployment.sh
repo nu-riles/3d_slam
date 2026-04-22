@@ -80,7 +80,7 @@ FRAMES_PER_CLIP = 3
 
 base      = Path('/scratch/' + os.environ['USER'] + '/lidar_fusion')
 out_dir   = base / 'output'
-decoder   = Path(os.path.expanduser('~/repos/dl/3d_slam/3d_slam/.envs/bin/draco_decoder'))
+decoder   = Path(os.path.expanduser('~/repos/dl/3d_slam/3d_slam/.env/bin/draco_decoder'))
 os.makedirs(out_dir, exist_ok=True)
 
 cam_zip   = base / 'camera/camera_front_wide_120fov/camera_front_wide_120fov.chunk_0000.zip'
