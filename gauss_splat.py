@@ -36,6 +36,9 @@ import torch
 import torch.nn.functional as F
 from gsplat import rasterization
 
+import gsplat
+help(gsplat.rasterization)
+
 # ---------------------------------------------------------------------------
 # Camera helpers
 # ---------------------------------------------------------------------------
