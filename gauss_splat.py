@@ -241,6 +241,13 @@ def train_clip(
   
     print(f"[{clip_uuid}] Initialising Gaussians from {ply_path.name}...")
     model  = GaussianModel(ply_path, device)
+
+    print(model.means.device)
+    print(model.quats.device)
+    print(model.log_scales.device)
+    print(model.logit_opacities.device)
+    print(model.sh0.device)
+  
     optim  = torch.optim.Adam(model.params(), lr=1e-3)
 
     lambda_depth = 0.1  # weight for depth loss term
