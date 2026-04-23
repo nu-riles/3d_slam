@@ -227,19 +227,19 @@ def train_clip(
         optim.zero_grad()
 
         renders, alphas, _ = rasterization(
-            means    = model.means,
-            quats    = F.normalize(model.quats, dim=-1),
-            scales   = model.get_scales(),
-            opacities= model.get_opacities(),
-            colors = model.get_colors().unsqueeze(0).expand(len(dataset.frames), -1, -1).to(device),
-            viewmats = viewmats,
-            Ks       = Ks,
-            width    = W,
-            height   = H,
-            sh_degree= 0,
+            means     = model.means,
+            quats     = F.normalize(model.quats, dim=-1),
+            scales    = model.get_scales(),
+            opacities = model.get_opacities(),
+            colors    = model.get_colors().unsqueeze(0).expand(len(dataset.frames), -1, -1).contiguous().to(device),
+            viewmats  = viewmats.contiguous().to(device),
+            Ks        = Ks.contiguous().to(device),
+            width     = W,
+            height    = H,
+            sh_degree = 0,
         )
 
-        loss = F.l1_loss(renders, gt_imgs)
+        loss = F.l1_loss(renders, gt_imgs.to(device))
         loss.backward()
         optim.step()
 
