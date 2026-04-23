@@ -252,6 +252,8 @@ def train_clip(
             sh_degree = 0,
         )
 
+        print("colors shape:", model.get_colors().shape)
+
         loss = F.l1_loss(renders, gt_imgs.to(device))
         loss.backward()
         optim.step()
