@@ -226,6 +226,15 @@ def train_clip(
     for step in range(iters):
         optim.zero_grad()
 
+        print("means:", model.means.device)
+        print("quats:", model.quats.device)
+        print("scales:", model.get_scales().device)
+        print("opacities:", model.get_opacities().device)
+        print("colors:", model.get_colors().device)
+        print("viewmats:", viewmats.device)
+        print("Ks:", Ks.device)
+        print("gt_imgs:", gt_imgs.device)
+
         renders, alphas, _ = rasterization(
             means     = model.means,
             quats     = F.normalize(model.quats, dim=-1),
