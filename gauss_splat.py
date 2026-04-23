@@ -245,7 +245,7 @@ def train_clip(
             quats     = F.normalize(model.quats, dim=-1),
             scales    = model.get_scales(),
             opacities = model.get_opacities(),
-            colors    = model.get_colors().unsqueeze(0).expand(len(dataset.frames), -1, -1).contiguous().to(device),
+            colors    = colors = model.get_colors().to(device),
             viewmats  = viewmats.contiguous().to(device),
             Ks        = Ks.contiguous().to(device),
             width     = W,
