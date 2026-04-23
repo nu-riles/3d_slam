@@ -174,7 +174,7 @@ class GaussianModel:
         self.device = device
 
         self.means     = torch.nn.Parameter(torch.tensor(pts,    device=device))
-        self.quats     = torch.nn.Parameter(torch.zeros(N, 4,    device=device).fill_(0).index_fill_(1, torch.tensor([0]), 1.0))  # identity quat
+        self.quats = torch.nn.Parameter(torch.zeros(N, 4, device=device).index_fill_(1, torch.tensor([0], device=device), 1.0))
         self.log_scales = torch.nn.Parameter(torch.full((N, 3), -3.0, device=device))
         self.logit_opacities = torch.nn.Parameter(torch.zeros(N, device=device))
         # SH degree 0: one coefficient per channel
