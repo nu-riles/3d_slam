@@ -202,7 +202,7 @@ class GaussianModel:
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-
+print(f"[{clip_uuid}] device={device}, cuda_available={torch.cuda.is_available()}")
 def train_clip(
     clip_uuid: str,
     ply_path: Path,
@@ -214,12 +214,16 @@ def train_clip(
 ):
     print(f"\n[{clip_uuid}] Loading data...")
     dataset = ClipDataset(clip_uuid, img_dir, calib_dir, device)
-    gt_imgs = dataset.get_images()        # (N, H, W, 3)
+    print("dataset loaded")
+    gt_imgs = dataset.get_images()
+    print("images loaded")       # (N, H, W, 3)
     viewmats, Ks = dataset.get_cameras()
+    print("cameras loaded")
     W, H = dataset.W, dataset.H
 
     print(f"[{clip_uuid}] Initialising Gaussians from {ply_path.name}...")
-    model  = GaussianModel(ply_path, device)
+    model = GaussianModel(ply_path, device)
+    print("model loaded")
     optim  = torch.optim.Adam(model.params(), lr=1e-3)
 
     print(f"[{clip_uuid}] Training {iters} iterations...")
