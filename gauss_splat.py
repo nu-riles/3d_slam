@@ -220,13 +220,18 @@ def train_clip(
 
     # Load per-frame LiDAR depth maps if available
     gt_depths = []
+  
     for i in range(len(dataset.frames)):
         depth_path = img_dir / f"{clip_uuid}.depth_{i}.npy"
+        print(f"  depth_{i} exists: {depth_path.exists()}")
         if depth_path.exists():
             d = np.load(str(depth_path))
+            print(f"  depth_{i} loaded, shape={d.shape}")
             gt_depths.append(torch.tensor(d, dtype=torch.float32, device=device))
+            print(f"  depth_{i} on device: {gt_depths[-1].device}")
         else:
             gt_depths.append(None)
+          
     use_depth = any(d is not None for d in gt_depths)
     if use_depth:
         print(f"[{clip_uuid}] Depth supervision enabled")
