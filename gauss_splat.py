@@ -231,6 +231,9 @@ def train_clip(
     if use_depth:
         print(f"[{clip_uuid}] Depth supervision enabled")
 
+    print("gt_imgs device:", gt_imgs.device)
+    print("gt_depths devices:", [d.device if d is not None else None for d in gt_depths])
+  
     print(f"[{clip_uuid}] Initialising Gaussians from {ply_path.name}...")
     model  = GaussianModel(ply_path, device)
     optim  = torch.optim.Adam(model.params(), lr=1e-3)
