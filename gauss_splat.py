@@ -202,7 +202,6 @@ class GaussianModel:
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-print(f"[{clip_uuid}] device={device}, cuda_available={torch.cuda.is_available()}")
 def train_clip(
     clip_uuid: str,
     ply_path: Path,
@@ -212,6 +211,8 @@ def train_clip(
     iters: int,
     device: torch.device,
 ):
+    print(f"[{clip_uuid}] device={device}, cuda_available={torch.cuda.is_available()}")
+
     print(f"\n[{clip_uuid}] Loading data...")
     dataset = ClipDataset(clip_uuid, img_dir, calib_dir, device)
     print("dataset loaded")
