@@ -168,8 +168,6 @@ def project_ftheta(points, T_lidar_to_cam, cx, cy, a2p, max_a, W, H):
     return np.stack([u,v_,d],axis=1), mask
 
 # --- Accumulate world-frame point cloud ---
-all_world_pts = []
-all_world_rgb = []
 
 for clip_uuid in tqdm(clip_uuids, desc='Clips'):
     try:
@@ -210,7 +208,7 @@ for clip_uuid in tqdm(clip_uuids, desc='Clips'):
         clip_pts = []
         clip_rgb = []
 
-        for fi in frame_indices:
+        for frame_i, fi in enumerate(frame_indices):
             cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
             ret, frame = cap.read()
             if not ret:
@@ -221,6 +219,18 @@ for clip_uuid in tqdm(clip_uuids, desc='Clips'):
             rgb = frame[uvd[:,1].astype(int), uvd[:,0].astype(int)][:,::-1] / 255.0
             clip_pts.append(colored_pts)
             clip_rgb.append(rgb)
+
+            # Save per-frame camera image
+            frame_path = out_dir / f'{clip_uuid}.frame_{frame_i}.png'
+            cv2.imwrite(str(frame_path), frame)
+
+            # Save per-frame depth map as float32 numpy array
+            depth_map = np.zeros((H, W), dtype=np.float32)
+            u_idx = uvd[:,0].astype(int)
+            v_idx = uvd[:,1].astype(int)
+            depth_map[v_idx, u_idx] = uvd[:,2]
+            depth_path = out_dir / f'{clip_uuid}.depth_{frame_i}.npy'
+            np.save(str(depth_path), depth_map)
 
         cap.release()
 
