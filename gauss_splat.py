@@ -174,7 +174,7 @@ class GaussianModel:
         self.device = device
 
         self.means     = torch.nn.Parameter(torch.tensor(pts,    device=device))
-        self.quats = torch.nn.Parameter(torch.zeros(N, 4, device=device).index_fill_(1, torch.tensor([0], device=device), 1.0))
+        self.quats     = torch.nn.Parameter(torch.zeros(N, 4, device=device).index_fill_(1, torch.tensor([0], device=device), 1.0))  # identity quat
         self.log_scales = torch.nn.Parameter(torch.full((N, 3), -3.0, device=device))
         self.logit_opacities = torch.nn.Parameter(torch.zeros(N, device=device))
         # SH degree 0: one coefficient per channel
@@ -220,34 +220,19 @@ def train_clip(
 
     # Load per-frame LiDAR depth maps if available
     gt_depths = []
-  
     for i in range(len(dataset.frames)):
         depth_path = img_dir / f"{clip_uuid}.depth_{i}.npy"
-        print(f"  depth_{i} exists: {depth_path.exists()}")
         if depth_path.exists():
             d = np.load(str(depth_path))
-            print(f"  depth_{i} loaded, shape={d.shape}")
             gt_depths.append(torch.tensor(d, dtype=torch.float32, device=device))
-            print(f"  depth_{i} on device: {gt_depths[-1].device}")
         else:
             gt_depths.append(None)
-          
     use_depth = any(d is not None for d in gt_depths)
     if use_depth:
         print(f"[{clip_uuid}] Depth supervision enabled")
 
-    print("gt_imgs device:", gt_imgs.device)
-    print("gt_depths devices:", [d.device if d is not None else None for d in gt_depths])
-  
     print(f"[{clip_uuid}] Initialising Gaussians from {ply_path.name}...")
     model  = GaussianModel(ply_path, device)
-
-    print(model.means.device)
-    print(model.quats.device)
-    print(model.log_scales.device)
-    print(model.logit_opacities.device)
-    print(model.sh0.device)
-  
     optim  = torch.optim.Adam(model.params(), lr=1e-3)
 
     lambda_depth = 0.1  # weight for depth loss term
