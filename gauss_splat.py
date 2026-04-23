@@ -35,6 +35,7 @@ import open3d as o3d
 import torch
 import torch.nn.functional as F
 from gsplat import rasterization
+
 # ---------------------------------------------------------------------------
 # Camera helpers
 # ---------------------------------------------------------------------------
@@ -173,7 +174,7 @@ class GaussianModel:
         self.device = device
 
         self.means     = torch.nn.Parameter(torch.tensor(pts,    device=device))
-        self.quats = torch.nn.Parameter(torch.zeros(N, 4, device=device).index_fill_(1, torch.tensor([0], device=device), 1.0))
+        self.quats     = torch.nn.Parameter(torch.zeros(N, 4,    device=device).fill_(0).index_fill_(1, torch.tensor([0]), 1.0))  # identity quat
         self.log_scales = torch.nn.Parameter(torch.full((N, 3), -3.0, device=device))
         self.logit_opacities = torch.nn.Parameter(torch.zeros(N, device=device))
         # SH degree 0: one coefficient per channel
@@ -194,12 +195,14 @@ class GaussianModel:
         return torch.sigmoid(self.logit_opacities)
 
     def get_colors(self):
-        return torch.sigmoid(self.sh0[:, 0, :] * 0.28209 + 0.5)  # (N, 3)
+        # SH degree 0 activation
+        return torch.sigmoid(self.sh0[:, 0, :] * 0.28209 + 0.5)
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+
 def train_clip(
     clip_uuid: str,
     ply_path: Path,
@@ -209,56 +212,73 @@ def train_clip(
     iters: int,
     device: torch.device,
 ):
-    print(f"[{clip_uuid}] device={device}, cuda_available={torch.cuda.is_available()}")
-
     print(f"\n[{clip_uuid}] Loading data...")
     dataset = ClipDataset(clip_uuid, img_dir, calib_dir, device)
-    print("dataset loaded")
-    gt_imgs = dataset.get_images()
-    print("images loaded")       # (N, H, W, 3)
+    gt_imgs = dataset.get_images()        # (N, H, W, 3)
     viewmats, Ks = dataset.get_cameras()
-    print("cameras loaded")
     W, H = dataset.W, dataset.H
 
+    # Load per-frame LiDAR depth maps if available
+    gt_depths = []
+    for i in range(len(dataset.frames)):
+        depth_path = img_dir / f"{clip_uuid}.depth_{i}.npy"
+        if depth_path.exists():
+            d = np.load(str(depth_path))
+            gt_depths.append(torch.tensor(d, dtype=torch.float32, device=device))
+        else:
+            gt_depths.append(None)
+    use_depth = any(d is not None for d in gt_depths)
+    if use_depth:
+        print(f"[{clip_uuid}] Depth supervision enabled")
+
     print(f"[{clip_uuid}] Initialising Gaussians from {ply_path.name}...")
-    model = GaussianModel(ply_path, device)
-    print("model loaded")
+    model  = GaussianModel(ply_path, device)
     optim  = torch.optim.Adam(model.params(), lr=1e-3)
+
+    lambda_depth = 0.1  # weight for depth loss term
 
     print(f"[{clip_uuid}] Training {iters} iterations...")
     for step in range(iters):
         optim.zero_grad()
 
-        print("means:", model.means.device)
-        print("quats:", model.quats.device)
-        print("scales:", model.get_scales().device)
-        print("opacities:", model.get_opacities().device)
-        print("colors:", model.get_colors().device)
-        print("viewmats:", viewmats.device)
-        print("Ks:", Ks.device)
-        print("gt_imgs:", gt_imgs.device)
-
-        renders, alphas, _ = rasterization(
-            means     = model.means,
-            quats     = F.normalize(model.quats, dim=-1),
-            scales    = model.get_scales(),
-            opacities = model.get_opacities(),
-            colors    = model.get_colors().unsqueeze(1).unsqueeze(0).expand(len(dataset.frames), -1, -1, -1).contiguous().to(device),
-            viewmats  = viewmats.contiguous().to(device),
-            Ks        = Ks.contiguous().to(device),
-            width     = W,
-            height    = H,
-            sh_degree = 0,
+        renders, alphas, meta = rasterization(
+            means       = model.means,
+            quats       = F.normalize(model.quats, dim=-1),
+            scales      = model.get_scales(),
+            opacities   = model.get_opacities(),
+            colors      = model.get_colors().unsqueeze(0).expand(len(dataset.frames), -1, -1),
+            viewmats    = viewmats,
+            Ks          = Ks,
+            width       = W,
+            height      = H,
+            sh_degree   = 0,
+            render_mode = "RGB+D",
         )
 
-        print("colors shape:", model.get_colors().shape)
+        # Split RGB and depth from render output
+        rgb_renders   = renders[..., :3]   # (N, H, W, 3)
+        depth_renders = renders[..., 3]    # (N, H, W)
 
-        loss = F.l1_loss(renders, gt_imgs.to(device))
+        photo_loss = F.l1_loss(rgb_renders, gt_imgs)
+
+        # Depth loss: only supervise where LiDAR depth is non-zero
+        depth_loss = torch.tensor(0.0, device=device)
+        if use_depth:
+            for i, gt_d in enumerate(gt_depths):
+                if gt_d is not None:
+                    valid = gt_d > 0
+                    if valid.any():
+                        depth_loss = depth_loss + F.l1_loss(
+                            depth_renders[i][valid], gt_d[valid]
+                        )
+            depth_loss = depth_loss / len(dataset.frames)
+
+        loss = photo_loss + lambda_depth * depth_loss
         loss.backward()
         optim.step()
 
         if step % 200 == 0:
-            print(f"  step {step:4d}/{iters}  loss={loss.item():.4f}")
+            print(f"  step {step:4d}/{iters}  loss={loss.item():.4f}  photo={photo_loss.item():.4f}  depth={depth_loss.item():.4f}")
 
     # Save trained Gaussians as PLY
     out_dir.mkdir(parents=True, exist_ok=True)
