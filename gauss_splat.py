@@ -194,8 +194,7 @@ class GaussianModel:
         return torch.sigmoid(self.logit_opacities)
 
     def get_colors(self):
-        # SH degree 0 activation
-        return torch.sigmoid(self.sh0[:, 0, :] * 0.28209 + 0.5)
+        return torch.sigmoid(self.sh0[:, 0, :] * 0.28209 + 0.5)  # (N, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +243,7 @@ def train_clip(
             quats     = F.normalize(model.quats, dim=-1),
             scales    = model.get_scales(),
             opacities = model.get_opacities(),
-            colors    = model.get_colors().unsqueeze(0).unsqueeze(0).expand(len(dataset.frames), -1, 1, -1).contiguous().to(device),
+            colors    = model.get_colors().unsqueeze(1).unsqueeze(0).expand(len(dataset.frames), -1, -1, -1).contiguous().to(device),
             viewmats  = viewmats.contiguous().to(device),
             Ks        = Ks.contiguous().to(device),
             width     = W,
