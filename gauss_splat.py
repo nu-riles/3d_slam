@@ -289,6 +289,87 @@ def train_clip(
     o3d.io.write_point_cloud(str(out_ply), final_pcd)
     print(f"[{clip_uuid}] Saved → {out_ply.name}")
 
+    # ── Evaluation metrics ───────────────────────────────────────────
+    metrics = {}
+    metrics["n_gaussians"] = len(model.means)
+
+    with torch.no_grad():
+        renders, alphas, _ = rasterization(
+            means       = model.means,
+            quats       = F.normalize(model.quats, dim=-1),
+            scales      = model.get_scales(),
+            opacities   = model.get_opacities(),
+            colors      = model.get_colors().unsqueeze(1).unsqueeze(0).expand(len(dataset.frames), -1, -1, -1).contiguous(),
+            viewmats    = viewmats,
+            Ks          = Ks,
+            width       = W,
+            height      = H,
+            sh_degree   = 0,
+            render_mode = "RGB+D",
+        )
+        rgb_renders   = renders[..., :3]
+        depth_renders = renders[..., 3]
+
+        # PSNR
+        mse = F.mse_loss(rgb_renders, gt_imgs).item()
+        metrics["psnr"] = 10 * np.log10(1.0 / (mse + 1e-10))
+
+        # SSIM (simple approximation)
+        mu1 = rgb_renders.mean(); mu2 = gt_imgs.mean()
+        s1  = rgb_renders.std();  s2  = gt_imgs.std()
+        cov = ((rgb_renders - mu1) * (gt_imgs - mu2)).mean()
+        c1, c2 = 0.01**2, 0.03**2
+        metrics["ssim"] = ((2*mu1*mu2 + c1) * (2*cov + c2) / 
+                           ((mu1**2 + mu2**2 + c1) * (s1**2 + s2**2 + c2))).item()
+
+        # Depth RMSE at valid LiDAR pixels
+        depth_errors = []
+        for i, gt_d in enumerate(gt_depths):
+            if gt_d is not None:
+                valid = gt_d > 0
+                if valid.any():
+                    err = (depth_renders[i][valid] - gt_d[valid]).pow(2).mean().sqrt()
+                    depth_errors.append(err.item())
+        metrics["depth_rmse"] = float(np.mean(depth_errors)) if depth_errors else None
+
+        # Chamfer distance (sampled — full set too large)
+        gauss_pts  = model.means.detach()
+        lidar_pcd  = o3d.io.read_point_cloud(str(ply_path))
+        lidar_pts  = torch.tensor(np.asarray(lidar_pcd.points), dtype=torch.float32, device=device)
+        # Sample 10k points from each for efficiency
+        n = min(10000, len(gauss_pts), len(lidar_pts))
+        g_idx = torch.randperm(len(gauss_pts))[:n]
+        l_idx = torch.randperm(len(lidar_pts))[:n]
+        g_sub = gauss_pts[g_idx].unsqueeze(0)   # (1, n, 3)
+        l_sub = lidar_pts[l_idx].unsqueeze(0)   # (1, n, 3)
+        dist_gl = torch.cdist(g_sub, l_sub).min(dim=2).values.mean()
+        dist_lg = torch.cdist(l_sub, g_sub).min(dim=2).values.mean()
+        metrics["chamfer"] = ((dist_gl + dist_lg) / 2).item()
+
+        # Final losses
+        metrics["final_photo_loss"] = photo_loss.item()
+        metrics["final_depth_loss"] = depth_loss.item()
+
+    # Print and save metrics
+    print(f"\n[{clip_uuid}] Metrics:")
+    print(f"  Gaussians:       {metrics['n_gaussians']:,}")
+    print(f"  PSNR:            {metrics['psnr']:.2f} dB")
+    print(f"  SSIM:            {metrics['ssim']:.4f}")
+    print(f"  Depth RMSE:      {metrics['depth_rmse']:.3f} m" if metrics['depth_rmse'] else "  Depth RMSE:      N/A")
+    print(f"  Chamfer dist:    {metrics['chamfer']:.4f} m")
+    print(f"  Final photo loss:{metrics['final_photo_loss']:.4f}")
+    print(f"  Final depth loss:{metrics['final_depth_loss']:.4f}")
+
+    # Append to CSV log
+    import csv
+    log_path = out_dir / "metrics.csv"
+    write_header = not log_path.exists()
+    with open(log_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["clip_uuid"] + list(metrics.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow({"clip_uuid": clip_uuid, **metrics})
+
 
 # ---------------------------------------------------------------------------
 # Entry point
