@@ -1,415 +1,256 @@
-"""
-gaussian_splat.py
-=================
-Trains a 3D Gaussian Splatting model per clip using:
-  - The per-clip colorized LiDAR PLY as point cloud initialisation
-  - The 3 sampled camera frames as training views
-  - Camera poses derived from the sensor extrinsics parquet
+#!/bin/bash
 
-Outputs one trained Gaussian PLY per clip to slam_output/gaussians/
+# Camera-LiDAR Fusion Pipeline - Deployment Script
+# Northeastern University Explorer HPC Cluster
+#
+# Prerequisites:
+#   - conda environment activated
+#   - HF_TOKEN exported
+#   - Running on a compute node (srun --partition=courses ...)
 
-Requirements
-------------
-    pip install gsplat torch torchvision open3d numpy opencv-python-headless
+set -e  # exit on error
 
-Usage
------
-    python gaussian_splat.py \
-        --ply_dir   /scratch/$USER/lidar_fusion/output \
-        --img_dir   /scratch/$USER/lidar_fusion/output \
-        --calib_dir /scratch/$USER/lidar_fusion/calibration \
-        --out_dir   /scratch/$USER/lidar_fusion/gaussians \
-        --iters     1000
-"""
+# ── Workspace ────────────────────────────────────────────────────────
+mkdir -p /scratch/$USER/lidar_fusion/output
+cd /scratch/$USER/lidar_fusion
 
-from __future__ import annotations
-
-import argparse
-import json
+# ── Download calibration metadata ───────────────────────────────────
+echo "Downloading calibration files..."
+python3 - <<'EOF'
+from huggingface_hub import hf_hub_download, login
 import os
+login(token=os.environ['HF_TOKEN'])
+base = '/scratch/' + os.environ['USER'] + '/lidar_fusion'
+for f in [
+    'calibration/camera_intrinsics.offline/camera_intrinsics.offline.chunk_0000.parquet',
+    'calibration/sensor_extrinsics.offline/sensor_extrinsics.offline.chunk_0000.parquet',
+]:
+    hf_hub_download(repo_id='nvidia/PhysicalAI-Autonomous-Vehicles',
+                    repo_type='dataset', filename=f, local_dir=base)
+    print(f'Downloaded {f}')
+EOF
+
+# ── Download camera and LiDAR chunk 0 (~32 GB) ──────────────────────
+echo "Downloading camera and LiDAR data (this will take a few minutes)..."
+python3 - <<'EOF'
+from huggingface_hub import hf_hub_download, login
+import os
+login(token=os.environ['HF_TOKEN'])
+base = '/scratch/' + os.environ['USER'] + '/lidar_fusion'
+for f in [
+    'camera/camera_front_wide_120fov/camera_front_wide_120fov.chunk_0000.zip',
+    'lidar/lidar_top_360fov/lidar_top_360fov.chunk_0000.zip',
+]:
+    print(f'Downloading {f}...')
+    hf_hub_download(repo_id='nvidia/PhysicalAI-Autonomous-Vehicles',
+                    repo_type='dataset', filename=f, local_dir=base)
+    print('Done.')
+EOF
+
+# ── Download egomotion for pose stitching ────────────────────────────
+echo "Downloading egomotion data..."
+python3 - <<'EOF'
+from huggingface_hub import hf_hub_download, login
+import os, zipfile
 from pathlib import Path
+login(token=os.environ['HF_TOKEN'])
+base = Path('/scratch/' + os.environ['USER'] + '/lidar_fusion')
+zip_path = hf_hub_download(repo_id='nvidia/PhysicalAI-Autonomous-Vehicles',
+                           repo_type='dataset',
+                           filename='labels/egomotion.offline/egomotion.offline.chunk_0000.zip',
+                           local_dir=str(base))
+# Extract all parquets from the zip
+with zipfile.ZipFile(zip_path) as zf:
+    for name in zf.namelist():
+        if name.endswith('.parquet'):
+            zf.extract(name, base / 'labels/egomotion.offline/')
+print('Downloaded and extracted egomotion')
+EOF
 
-import cv2
-import numpy as np
+# ── Run the multi-clip fusion pipeline ──────────────────────────────
+echo "Running fusion pipeline across 25 clips, 3 frames each..."
+python3 - <<'EOF'
+import pandas as pd, numpy as np, json, os, cv2, subprocess, tempfile, zipfile
+from pathlib import Path
+from tqdm import tqdm
 import open3d as o3d
-import torch
-import torch.nn.functional as F
-from gsplat import rasterization
 
-# ---------------------------------------------------------------------------
-# Camera helpers
-# ---------------------------------------------------------------------------
+NUM_CLIPS   = 25
+FRAMES_PER_CLIP = 3
 
-def quat_to_R(qx, qy, qz, qw) -> np.ndarray:
-    return np.array([
-        [1-2*(qy**2+qz**2),  2*(qx*qy-qz*qw),  2*(qx*qz+qy*qw)],
-        [  2*(qx*qy+qz*qw), 1-2*(qx**2+qz**2),  2*(qy*qz-qx*qw)],
-        [  2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw), 1-2*(qx**2+qy**2)],
-    ], dtype=np.float32)
+base      = Path('/scratch/' + os.environ['USER'] + '/lidar_fusion')
+out_dir   = base / 'output'
+decoder   = Path(os.path.expanduser('~/repos/dl/3d_slam/3d_slam/.env/bin/draco_decoder'))
+os.makedirs(out_dir, exist_ok=True)
 
+cam_zip   = base / 'camera/camera_front_wide_120fov/camera_front_wide_120fov.chunk_0000.zip'
+lidar_zip = base / 'lidar/lidar_top_360fov/lidar_top_360fov.chunk_0000.zip'
 
-def poly(coeffs, x):
-    return sum(c * x**i for i, c in enumerate(coeffs))
+# --- Load calibration ---
+intr_df = pd.read_parquet(base/'calibration/camera_intrinsics.offline/camera_intrinsics.offline.chunk_0000.parquet').reset_index()
+ext_df  = pd.read_parquet(base/'calibration/sensor_extrinsics.offline/sensor_extrinsics.offline.chunk_0000.parquet').reset_index()
+ego_zip = base/'labels/egomotion.offline/egomotion.offline.chunk_0000.zip'
 
+# --- Get all clip UUIDs from chunk 0 ---
+with zipfile.ZipFile(cam_zip) as zf:
+    all_uuids = list(dict.fromkeys(
+        n.split('.')[0].split('/')[-1] for n in zf.namelist() if n.endswith('.mp4')
+    ))
+clip_uuids = all_uuids[:NUM_CLIPS]
+print(f'Found {len(all_uuids)} clips, processing {len(clip_uuids)}')
 
-def ftheta_to_pinhole_K(cx, cy, a2p, W, H):
-    """
-    Approximate a pinhole K from the ftheta model by computing
-    the effective focal length at the image centre.
-    """
-    # At small angles, r_pix ≈ a2p[1] * theta, and for pinhole f = r/tan(theta) ≈ r/theta
-    f = a2p[1] if len(a2p) > 1 else 800.0
-    return np.array([
-        [f,  0, cx],
-        [0,  f, cy],
-        [0,  0,  1],
-    ], dtype=np.float32)
+# --- Helpers ---
+def quat_to_R(qx,qy,qz,qw):
+    return np.array([[1-2*(qy**2+qz**2),2*(qx*qy-qz*qw),2*(qx*qz+qy*qw)],
+                     [2*(qx*qy+qz*qw),1-2*(qx**2+qz**2),2*(qy*qz-qx*qw)],
+                     [2*(qx*qz-qy*qw),2*(qy*qz+qx*qw),1-2*(qx**2+qy**2)]])
 
+def get_T(df, clip, sensor):
+    r = df[(df.clip_id==clip)&(df.sensor_name==sensor)].iloc[0]
+    T = np.eye(4); T[:3,:3]=quat_to_R(r.qx,r.qy,r.qz,r.qw); T[:3,3]=[r.x,r.y,r.z]
+    return T
 
-# ---------------------------------------------------------------------------
-# Dataset loader for a single clip
-# ---------------------------------------------------------------------------
+def get_ego_T(clip):
+    try:
+        with zipfile.ZipFile(ego_zip) as zf:
+            fname = f"{clip}.egomotion.offline.parquet"
+            with zf.open(fname) as f:
+                rows = pd.read_parquet(f).reset_index().sort_values("timestamp_ns")
+        if rows.empty:
+            return np.eye(4)
+        r = rows.iloc[0]
+        T = np.eye(4)
+        T[:3,:3] = quat_to_R(r.qx, r.qy, r.qz, r.qw)
+        T[:3,3]  = [r.x, r.y, r.z]
+        return T
+    except Exception:
+        return np.eye(4)
 
-class ClipDataset:
-    """
-    Loads the 3 training frames and camera parameters for one clip.
-    """
+def decode_draco(raw):
+    with tempfile.TemporaryDirectory() as tmp:
+        inp = os.path.join(tmp,'s.drc'); outp = os.path.join(tmp,'s.ply')
+        open(inp,'wb').write(raw)
+        subprocess.run([str(decoder),'-i',inp,'-o',outp],check=True,capture_output=True)
+        content = open(outp,'rb').read()
+        hend = content.index(b'end_header\n') + len(b'end_header\n')
+        hdr  = content[:hend].decode().split('\n')
+        nv   = int(next(l for l in hdr if l.startswith('element vertex')).split()[-1])
+        np_  = len([l for l in hdr if l.startswith('property float')])
+        return np.frombuffer(content[hend:],dtype=np.float32)[:nv*np_].reshape(nv,np_)
 
-    def __init__(self, clip_uuid: str, img_dir: Path, calib_dir: Path, device: torch.device):
-        self.clip_uuid = clip_uuid
-        self.device    = device
+def extract_clip(zip_path, uuid, dest):
+    with zipfile.ZipFile(zip_path) as zf:
+        match = next((n for n in zf.namelist() if uuid in n), None)
+        if match is None:
+            return None
+        out = dest / os.path.basename(match)
+        with zf.open(match) as s, open(out, 'wb') as d: d.write(s.read())
+        return out
 
-        import pandas as pd
+def poly(c, x): return sum(v*x**i for i,v in enumerate(c))
 
-        # Load calibration
-        intr_df = pd.read_parquet(
-            calib_dir / "camera_intrinsics.offline/camera_intrinsics.offline.chunk_0000.parquet"
-        ).reset_index()
-        ext_df = pd.read_parquet(
-            calib_dir / "sensor_extrinsics.offline/sensor_extrinsics.offline.chunk_0000.parquet"
-        ).reset_index()
+def project_ftheta(points, T_lidar_to_cam, cx, cy, a2p, max_a, W, H):
+    N = len(points)
+    pts_h = np.hstack([points, np.ones((N,1), dtype=np.float32)])
+    pc = (T_lidar_to_cam @ pts_h.T).T
+    Xc,Yc,Zc = pc[:,0],pc[:,1],pc[:,2]
+    v1 = Zc>0.1; Xc,Yc,Zc = Xc[v1],Yc[v1],Zc[v1]
+    theta = np.arccos(np.clip(Zc/np.sqrt(Xc**2+Yc**2+Zc**2),-1,1))
+    v2 = theta<max_a; Xc,Yc,Zc,theta = Xc[v2],Yc[v2],Zc[v2],theta[v2]
+    r_pix = poly(a2p,theta); r_xy = np.sqrt(Xc**2+Yc**2)+1e-9
+    u  = cx + r_pix*(Xc/r_xy)
+    v_ = cy + r_pix*(Yc/r_xy)
+    d  = np.sqrt(Xc**2+Yc**2+Zc**2)
+    v3 = (u>=0)&(u<W)&(v_>=0)&(v_<H)
+    u,v_,d = u[v3],v_[v3],d[v3]
+    idx = np.where(v1)[0][v2][v3]
+    mask = np.zeros(N, dtype=bool); mask[idx] = True
+    return np.stack([u,v_,d],axis=1), mask
 
-        row    = intr_df[(intr_df["clip_id"]==clip_uuid) &
-                         (intr_df["camera_name"]=="camera_front_wide_120fov")].iloc[0]
-        params = json.loads(row["model_parameters"])
-        cx, cy    = params["principal_point"]
-        a2p       = params["angle_to_pixeldist_poly"]
-        self.W, self.H = params["resolution"]
-        self.K    = ftheta_to_pinhole_K(cx, cy, a2p, self.W, self.H)
+# --- Accumulate world-frame point cloud ---
 
-        # Camera-to-world transform
-        r = ext_df[(ext_df["clip_id"]==clip_uuid) &
-                   (ext_df["sensor_name"]=="camera_front_wide_120fov")].iloc[0]
-        R = quat_to_R(r.qx, r.qy, r.qz, r.qw)
-        t = np.array([r.x, r.y, r.z], dtype=np.float32)
-        # Build 4x4 world-to-camera (view) matrix
-        c2w       = np.eye(4, dtype=np.float32)
-        c2w[:3,:3] = R
-        c2w[:3, 3] = t
-        self.w2c  = np.linalg.inv(c2w)
-
-        # Load frames saved during the fusion pipeline
-        # Expected naming: <clip_uuid>.camera_front_wide_120fov.frame_<N>.png
-        # Fall back to reading from the mp4 if PNGs aren't present
-        self.frames = self._load_frames(img_dir)
-
-    def _load_frames(self, img_dir: Path) -> list[np.ndarray]:
-        """Try PNG first, fall back to mp4."""
-        pngs = sorted(img_dir.glob(f"{self.clip_uuid}.frame_*.png"))
-        if pngs:
-            return [cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB) for p in pngs]
-
-        mp4 = img_dir / f"{self.clip_uuid}.camera_front_wide_120fov.mp4"
-        if not mp4.exists():
-            raise FileNotFoundError(f"No frames or mp4 found for {self.clip_uuid}")
-
-        cap   = cv2.VideoCapture(str(mp4))
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        idxs  = np.linspace(0, total - 1, 3, dtype=int)
-        frames = []
-        for idx in idxs:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if ret:
-                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        cap.release()
-        return frames
-
-    def get_cameras(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns (viewmats, Ks, image_wh) batched for gsplat.
-        viewmats: (N, 4, 4) world-to-camera
-        Ks:       (N, 3, 3) intrinsics
-        """
-        N = len(self.frames)
-        viewmats = torch.tensor(self.w2c, dtype=torch.float32, device=self.device).unsqueeze(0).expand(N, -1, -1)
-        Ks       = torch.tensor(self.K,   dtype=torch.float32, device=self.device).unsqueeze(0).expand(N, -1, -1)
-        return viewmats, Ks
-
-    def get_images(self) -> torch.Tensor:
-        """Returns (N, H, W, 3) float32 [0,1] tensor."""
-        imgs = []
-        for f in self.frames:
-            resized = cv2.resize(f, (self.W, self.H))
-            imgs.append(torch.tensor(resized / 255.0, dtype=torch.float32))
-        return torch.stack(imgs).to(self.device)   # (N, H, W, 3)
-
-
-# ---------------------------------------------------------------------------
-# Gaussian model
-# ---------------------------------------------------------------------------
-
-class GaussianModel:
-    """
-    Minimal trainable Gaussian model initialised from a PLY point cloud.
-    Parameters: means, quats, scales, opacities, colors (SH degree 0)
-    """
-
-    def __init__(self, ply_path: Path, device: torch.device):
-        pcd    = o3d.io.read_point_cloud(str(ply_path))
-        pts    = np.asarray(pcd.points,  dtype=np.float32)
-        colors = np.asarray(pcd.colors,  dtype=np.float32)  # (N, 3) [0,1]
-
-        N = len(pts)
-        self.device = device
-
-        self.means     = torch.nn.Parameter(torch.tensor(pts,    device=device))
-        self.quats     = torch.nn.Parameter(torch.zeros(N, 4, device=device).index_fill_(1, torch.tensor([0], device=device), 1.0))  # identity quat
-        self.log_scales = torch.nn.Parameter(torch.full((N, 3), -3.0, device=device))
-        self.logit_opacities = torch.nn.Parameter(torch.zeros(N, device=device))
-        # SH degree 0: one coefficient per channel
-        self.sh0       = torch.nn.Parameter(
-            torch.tensor(
-                (colors - 0.5) / 0.28209,  # inverse SH activation
-                dtype=torch.float32, device=device
-            ).unsqueeze(1)   # (N, 1, 3)
-        )
-
-    def params(self):
-        return [self.means, self.quats, self.log_scales, self.logit_opacities, self.sh0]
-
-    def get_scales(self):
-        return torch.exp(self.log_scales)
-
-    def get_opacities(self):
-        return torch.sigmoid(self.logit_opacities)
-
-    def get_colors(self):
-        # SH degree 0 activation
-        return torch.sigmoid(self.sh0[:, 0, :] * 0.28209 + 0.5)
-
-
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
-def train_clip(
-    clip_uuid: str,
-    ply_path: Path,
-    img_dir: Path,
-    calib_dir: Path,
-    out_dir: Path,
-    iters: int,
-    device: torch.device,
-):
-    print(f"\n[{clip_uuid}] Loading data...")
-    dataset = ClipDataset(clip_uuid, img_dir, calib_dir, device)
-    gt_imgs = dataset.get_images()        # (N, H, W, 3)
-    viewmats, Ks = dataset.get_cameras()
-    W, H = dataset.W, dataset.H
-
-    # Load per-frame LiDAR depth maps if available
-    gt_depths = []
-    for i in range(len(dataset.frames)):
-        depth_path = img_dir / f"{clip_uuid}.depth_{i}.npy"
-        if depth_path.exists():
-            d = np.load(str(depth_path))
-            gt_depths.append(torch.tensor(d, dtype=torch.float32, device=device))
-        else:
-            gt_depths.append(None)
-    use_depth = any(d is not None for d in gt_depths)
-    if use_depth:
-        print(f"[{clip_uuid}] Depth supervision enabled")
-
-    print(f"[{clip_uuid}] Initialising Gaussians from {ply_path.name}...")
-    model  = GaussianModel(ply_path, device)
-    optim  = torch.optim.Adam(model.params(), lr=1e-3)
-
-    lambda_depth = 0.1  # weight for depth loss term
-
-    print(f"[{clip_uuid}] Training {iters} iterations...")
-    for step in range(iters):
-        optim.zero_grad()
-
-        renders, alphas, meta = rasterization(
-            means       = model.means,
-            quats       = F.normalize(model.quats, dim=-1),
-            scales      = model.get_scales(),
-            opacities   = model.get_opacities(),
-            colors      = model.get_colors().unsqueeze(1).unsqueeze(0).expand(len(dataset.frames), -1, -1, -1).contiguous(),
-            viewmats    = viewmats,
-            Ks          = Ks,
-            width       = W,
-            height      = H,
-            sh_degree   = 0,
-            render_mode = "RGB+D",
-        )
-
-        # Split RGB and depth from render output
-        rgb_renders   = renders[..., :3]   # (N, H, W, 3)
-        depth_renders = renders[..., 3]    # (N, H, W)
-
-        photo_loss = F.l1_loss(rgb_renders, gt_imgs)
-
-        # Depth loss: only supervise where LiDAR depth is non-zero
-        depth_loss = torch.tensor(0.0, device=device)
-        if use_depth:
-            for i, gt_d in enumerate(gt_depths):
-                if gt_d is not None:
-                    valid = gt_d > 0
-                    if valid.any():
-                        depth_loss = depth_loss + F.l1_loss(
-                            depth_renders[i][valid], gt_d[valid]
-                        )
-            depth_loss = depth_loss / len(dataset.frames)
-
-        loss = photo_loss + lambda_depth * depth_loss
-        loss.backward()
-        optim.step()
-
-        if step % 200 == 0:
-            print(f"  step {step:4d}/{iters}  loss={loss.item():.4f}  photo={photo_loss.item():.4f}  depth={depth_loss.item():.4f}")
-
-    # Save trained Gaussians as PLY
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_ply = out_dir / f"{clip_uuid}.gaussian.ply"
-    final_pcd = o3d.geometry.PointCloud()
-    final_pcd.points = o3d.utility.Vector3dVector(model.means.detach().cpu().numpy())
-    final_pcd.colors = o3d.utility.Vector3dVector(model.get_colors().detach().cpu().numpy())
-    o3d.io.write_point_cloud(str(out_ply), final_pcd)
-    print(f"[{clip_uuid}] Saved → {out_ply.name}")
-
-    # ── Evaluation metrics ───────────────────────────────────────────
-    metrics = {}
-    metrics["n_gaussians"] = len(model.means)
-
-    with torch.no_grad():
-        renders, alphas, _ = rasterization(
-            means       = model.means,
-            quats       = F.normalize(model.quats, dim=-1),
-            scales      = model.get_scales(),
-            opacities   = model.get_opacities(),
-            colors      = model.get_colors().unsqueeze(1).unsqueeze(0).expand(len(dataset.frames), -1, -1, -1).contiguous(),
-            viewmats    = viewmats,
-            Ks          = Ks,
-            width       = W,
-            height      = H,
-            sh_degree   = 0,
-            render_mode = "RGB+D",
-        )
-        rgb_renders   = renders[..., :3]
-        depth_renders = renders[..., 3]
-
-        # PSNR
-        mse = F.mse_loss(rgb_renders, gt_imgs).item()
-        metrics["psnr"] = 10 * np.log10(1.0 / (mse + 1e-10))
-
-        # SSIM (simple approximation)
-        mu1 = rgb_renders.mean(); mu2 = gt_imgs.mean()
-        s1  = rgb_renders.std();  s2  = gt_imgs.std()
-        cov = ((rgb_renders - mu1) * (gt_imgs - mu2)).mean()
-        c1, c2 = 0.01**2, 0.03**2
-        metrics["ssim"] = ((2*mu1*mu2 + c1) * (2*cov + c2) / 
-                           ((mu1**2 + mu2**2 + c1) * (s1**2 + s2**2 + c2))).item()
-
-        # Depth RMSE at valid LiDAR pixels
-        depth_errors = []
-        for i, gt_d in enumerate(gt_depths):
-            if gt_d is not None:
-                valid = gt_d > 0
-                if valid.any():
-                    err = (depth_renders[i][valid] - gt_d[valid]).pow(2).mean().sqrt()
-                    depth_errors.append(err.item())
-        metrics["depth_rmse"] = float(np.mean(depth_errors)) if depth_errors else None
-
-        # Chamfer distance (sampled — full set too large)
-        gauss_pts  = model.means.detach()
-        lidar_pcd  = o3d.io.read_point_cloud(str(ply_path))
-        lidar_pts  = torch.tensor(np.asarray(lidar_pcd.points), dtype=torch.float32, device=device)
-        # Sample 10k points from each for efficiency
-        n = min(10000, len(gauss_pts), len(lidar_pts))
-        g_idx = torch.randperm(len(gauss_pts))[:n]
-        l_idx = torch.randperm(len(lidar_pts))[:n]
-        g_sub = gauss_pts[g_idx].unsqueeze(0)   # (1, n, 3)
-        l_sub = lidar_pts[l_idx].unsqueeze(0)   # (1, n, 3)
-        dist_gl = torch.cdist(g_sub, l_sub).min(dim=2).values.mean()
-        dist_lg = torch.cdist(l_sub, g_sub).min(dim=2).values.mean()
-        metrics["chamfer"] = ((dist_gl + dist_lg) / 2).item()
-
-        # Final losses
-        metrics["final_photo_loss"] = photo_loss.item()
-        metrics["final_depth_loss"] = depth_loss.item()
-
-    # Print and save metrics
-    print(f"\n[{clip_uuid}] Metrics:")
-    print(f"  Gaussians:       {metrics['n_gaussians']:,}")
-    print(f"  PSNR:            {metrics['psnr']:.2f} dB")
-    print(f"  SSIM:            {metrics['ssim']:.4f}")
-    print(f"  Depth RMSE:      {metrics['depth_rmse']:.3f} m" if metrics['depth_rmse'] else "  Depth RMSE:      N/A")
-    print(f"  Chamfer dist:    {metrics['chamfer']:.4f} m")
-    print(f"  Final photo loss:{metrics['final_photo_loss']:.4f}")
-    print(f"  Final depth loss:{metrics['final_depth_loss']:.4f}")
-
-    # Append to CSV log
-    import csv
-    log_path = out_dir / "metrics.csv"
-    write_header = not log_path.exists()
-    with open(log_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["clip_uuid"] + list(metrics.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow({"clip_uuid": clip_uuid, **metrics})
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ply_dir",   required=True, help="Directory containing per-clip PLY files")
-    parser.add_argument("--img_dir",   required=True, help="Directory containing camera frames or mp4s")
-    parser.add_argument("--calib_dir", required=True, help="Directory containing calibration parquets")
-    parser.add_argument("--out_dir",   required=True, help="Output directory for Gaussian PLYs")
-    parser.add_argument("--iters",     type=int, default=1000)
-    args = parser.parse_args()
-
-    device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    ply_dir  = Path(args.ply_dir)
-    img_dir  = Path(args.img_dir)
-    calib_dir = Path(args.calib_dir)
-    out_dir  = Path(args.out_dir)
-
-    # Find all per-clip PLYs (exclude any gaussian outputs)
-    ply_files = [p for p in ply_dir.glob("*.ply") if "gaussian" not in p.name]
-    print(f"Found {len(ply_files)} clip PLYs to process")
-
-    for ply_path in sorted(ply_files):
-        clip_uuid = ply_path.stem
-        try:
-            train_clip(
-                clip_uuid = clip_uuid,
-                ply_path  = ply_path,
-                img_dir   = img_dir,
-                calib_dir = calib_dir,
-                out_dir   = out_dir,
-                iters     = args.iters,
-                device    = device,
-            )
-        except Exception as e:
-            print(f"[{clip_uuid}] Skipping: {e}")
+for clip_uuid in tqdm(clip_uuids, desc='Clips'):
+    try:
+        # Extract files
+        cam_mp4  = extract_clip(cam_zip,   clip_uuid, out_dir)
+        lidar_pq = extract_clip(lidar_zip, clip_uuid, out_dir)
+        if cam_mp4 is None or lidar_pq is None:
+            print(f'  Skipping {clip_uuid}: files not found in zip')
             continue
 
-    print(f"\nAll Gaussian PLYs saved to {out_dir}")
+        # Calibration for this clip
+        intr_row = intr_df[(intr_df.clip_id==clip_uuid)&(intr_df.camera_name=='camera_front_wide_120fov')]
+        if intr_row.empty:
+            print(f'  Skipping {clip_uuid}: no intrinsics')
+            continue
+        params = json.loads(intr_row.iloc[0].model_parameters)
+        cx,cy  = params['principal_point']
+        a2p    = params['angle_to_pixeldist_poly']
+        max_a  = params['max_angle']
+        W,H    = params['resolution']
+
+        T_lidar_to_cam = np.linalg.inv(get_T(ext_df,clip_uuid,'camera_front_wide_120fov')) \
+                         @ get_T(ext_df,clip_uuid,'lidar_top_360fov')
+
+        # Ego pose in world frame for this clip
+        T_ego = get_ego_T(clip_uuid)
+
+        # Decode LiDAR (first 10 spins)
+        df_lidar = pd.read_parquet(lidar_pq)
+        points   = np.concatenate([decode_draco(bytes(r))
+                                   for r in df_lidar['draco_encoded_pointcloud'].iloc[:10]])
+
+        # Sample 3 evenly-spaced frames from the video
+        cap   = cv2.VideoCapture(str(cam_mp4))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_indices = np.linspace(0, total-1, FRAMES_PER_CLIP, dtype=int)
+
+        clip_pts = []
+        clip_rgb = []
+
+        for frame_i, fi in enumerate(frame_indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            uvd, mask = project_ftheta(points, T_lidar_to_cam, cx, cy, a2p, max_a, W, H)
+            colored_pts = points[mask]
+            rgb = frame[uvd[:,1].astype(int), uvd[:,0].astype(int)][:,::-1] / 255.0
+            clip_pts.append(colored_pts)
+            clip_rgb.append(rgb)
+
+            # Save per-frame camera image
+            frame_path = out_dir / f'{clip_uuid}.frame_{frame_i}.png'
+            cv2.imwrite(str(frame_path), frame)
+
+            # Save per-frame depth map as float32 numpy array
+            depth_map = np.zeros((H, W), dtype=np.float32)
+            u_idx = uvd[:,0].astype(int)
+            v_idx = uvd[:,1].astype(int)
+            depth_map[v_idx, u_idx] = uvd[:,2]
+            depth_path = out_dir / f'{clip_uuid}.depth_{frame_i}.npy'
+            np.save(str(depth_path), depth_map)
+
+        cap.release()
+
+        # Merge 3 frames and save per-clip PLY
+        if clip_pts:
+            merged_pts = np.vstack(clip_pts).astype(np.float64)
+            merged_rgb = np.vstack(clip_rgb).astype(np.float64)
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(merged_pts)
+            pcd.colors = o3d.utility.Vector3dVector(merged_rgb)
+            pcd = pcd.voxel_down_sample(voxel_size=0.05)
+            ply_path = out_dir / f'{clip_uuid}.ply'
+            o3d.io.write_point_cloud(str(ply_path), pcd)
+            print(f'  {clip_uuid}: {len(pcd.points):,} pts saved to {ply_path.name}')
+
+    except Exception as e:
+        print(f'  Skipping {clip_uuid}: {e}')
+        continue
+
+print(f'\nAll outputs in {out_dir}')
+EOF
+
+echo "All done. Outputs in /scratch/$USER/lidar_fusion/output/"
